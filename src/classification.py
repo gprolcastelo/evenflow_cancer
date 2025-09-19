@@ -6,7 +6,8 @@ import os
 import matplotlib.pyplot as plt
 import optuna
 import xgboost as xgb
-from sklearn.preprocessing import label_binarize
+from sklearn.preprocessing import label_binarize, StandardScaler, MinMaxScaler
+from sklearn.pipeline import Pipeline
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.utils.class_weight import compute_class_weight
@@ -41,11 +42,14 @@ def classification_metrics(y_test_le, y_pred, num_classes, weights_test=None):
     precision = [report[str(i)]['precision'] for i in range(num_classes)]
     recall = [report[str(i)]['recall'] for i in range(num_classes)]
     f1_score = [report[str(i)]['f1-score'] for i in range(num_classes)]
+    # Get macro metrics from the classification report
+    macro_precision = report['macro avg']['precision']
+    macro_recall = report['macro avg']['recall']
+    macro_f1_score = report['macro avg']['f1-score']
 
     # Calculate AUC-ROC and AUC-PR
-
-    print("Shape of y_true (y_test_bin):", np.array(y_test_bin).shape)
-    print("Shape of y_score (y_pred):", np.array(y_pred).shape)
+    # print("Shape of y_true (y_test_bin):", np.array(y_test_bin).shape)
+    # print("Shape of y_score (y_pred):", np.array(y_pred).shape)
     auc_roc = roc_auc_score(y_true=y_test_bin, y_score=y_pred,
                             multi_class='ovr',
                             average='weighted',
@@ -70,9 +74,9 @@ def classification_metrics(y_test_le, y_pred, num_classes, weights_test=None):
 
     # Combine all metrics into a single DataFrame
     metrics = pd.DataFrame({
-        'Precision': precision,
-        'Recall': recall,
-        'F1 Score': f1_score,
+        'Macro Precision': macro_precision,
+        'Macro Recall': macro_recall,
+        'Macro F1 Score': macro_f1_score,
         'AUC-ROC OvR': [auc_roc] * num_classes,
         # 'AUC-ROC OvO': [auc_roc_ovo]*num_classes,
         'AUC-PR': [auc_pr] * num_classes,
@@ -209,22 +213,22 @@ def classification_benchmark(X_data, y_data, classification_type, num_classes,
     # classes1 = le_train.classes_; classes2 = le_test.classes_
     y_train_le = le_train.transform(y_train)
     y_test_le = le_test.transform(y_test)
-    print(y_train_le.shape, y_test_le.shape)
+    # print(y_train_le.shape, y_test_le.shape)
     # Get dictionary of classes
     classes = np.unique(y_data)
     classes_dict = {key: value for value, key in enumerate(classes)}
-    print('classes_dict:', classes_dict)
-    print('classes_dict.values:', classes_dict.values())
-    print('classes_dict.keys:', classes_dict.keys())
+    # print('classes_dict:', classes_dict)
+    # print('classes_dict.values:', classes_dict.values())
+    # print('classes_dict.keys:', classes_dict.keys())
 
     # Weighted case:
     if classification_type == 'weighted':
         # Create classification matrices
         class_weights = compute_class_weight('balanced', classes=classes, y=y_data)
-        print("Class weights: ", class_weights)
+        # print("Class weights: ", class_weights)
         # Create a dictionary mapping class labels to their corresponding weights
         class_weight_dict = dict(zip(classes, class_weights))
-        print("Class weight dictionary: ", class_weight_dict)
+        # print("Class weight dictionary: ", class_weight_dict)
         # Define the weights for each class
         weights_train = np.zeros(len(y_train_le))
         weights_test = np.zeros(len(y_test_le))
@@ -266,26 +270,131 @@ def classification_benchmark(X_data, y_data, classification_type, num_classes,
 
         # Get parameters for xgboost
         params = study.best_params
-        print('study_params = ', params)
+        # print('study_params = ', params)
         all_params = {**my_params, **params}
     else:
         all_params = my_params
-    print('all_params = ', all_params)
+    # print('all_params = ', all_params)
 
     # Train the model
-    print('Training the model...')
+    # print('Training the model...')
     model = xgb.train(all_params, dtrain_clf, num_boost_round=n_br, verbose_eval=True)
     # Make predictions on the test set
-    print('Making predictions...')
+    # print('Making predictions...')
     y_pred = model.predict(dtest_clf)
     # print('y_pred.shape =',y_pred.shape)
     # print('y_test_le.shape =', y_test_le.shape)
     # Calculate classification metrics for unbalanced case
-    print('Calculating classification metrics...')
+    # print('Calculating classification metrics...')
     metrics = classification_metrics(y_test_le, y_pred, num_classes=num_classes, weights_test=weights_test)
     metrics.index = classes_dict.keys()
 
     # Plot metrics
     # axs, figs = plot_metrics(metrics_here=metrics, title=title_plot,ax=ax,save_path=None,save_name='metrics_unbalanced',show_legend=True,show_plot=False)
     return model, metrics, y_test_le, y_pred, (X_train, X_test, y_train, y_test), all_params
+
+def cancer_classification(histological_type_i, rnaseq, clinical_here, save_dir,
+                          features=None,
+                          n_threads=os.cpu_count(),
+                          n_trials_optuna=100,
+                          n_br=100,
+                          classification_type='weighted',
+                          stage_classification='i_ii_iii_iv',
+                          possible_stages=['Stage I', 'Stage II', 'Stage III', 'Stage IV'],
+                          scaler=None,
+                          per=20,
+                          test_size=0.2, preprocess=True, seed_here=np.random.randint(0, 1e6)):
+    '''
+    Classify cancer histological type. This function follows these steps:
+    1. Extract corresponding stage and RNASeq information of given cancer
+    2. Preprocessing: removing lowly-expressed and lowly-variance genes.
+    3. Stage classification, based on the rnaseq data of the patients with the histological type  and the stage data from the clinical dataset.
+    Classification is performed through xgboost, after optimizing the hyperparameters with optuna.
+
+    :param histological_type_i: cancer type to classify
+    :param rnaseq: rnaseq data for patients and genes
+    :param clinical_here: clinical data, including histological type and stage
+    :param save_dir: path to save the classification results
+    :param features: features (genes) to select from rnaseq for classification
+    :param n_threads: number of threads to use for parallel processing
+    :param n_trials_optuna: number of optuna trials
+    :param n_br: number of boosting rounds for xgboost
+    :param classification_type: must begin with 'weighted' or 'unbalanced'
+    :param stage_classification: type of classification to perform
+    :param possible_stages: use only these stages for classification; can also be 'early' and 'late'
+    :param scaler: scaler to use for data preprocessing or pipeline of scalers
+    :param per: percentage of zeros in rnaseq to remove genes during preprocessing
+    :param test_size: test size for classification
+    :return:
+    '''
+    assert classification_type.startswith('weighted') or classification_type.startswith('unbalanced')
+    assert stage_classification in ['i_ii_iii_iv', 'i_ii_iii', 'early_late']
+    assert possible_stages in [['Stage I', 'Stage II', 'Stage III', 'Stage IV'], ['Stage I', 'Stage II', 'Stage III'],
+                               ['early', 'late']]
+    assert scaler is None or isinstance(scaler, StandardScaler) or isinstance(scaler, Pipeline) or isinstance(scaler,
+                                                                                                              MinMaxScaler)
+    assert isinstance(per, int) and per > 0 and per < 100
+    # Set random seed
+    # seed_here = np.random.randint(0,1e6)
+    # Save path
+    print(histological_type_i)
+    save_dir_i = os.path.join(save_dir, histological_type_i)
+    os.makedirs(save_dir_i, exist_ok=True)
+    # Get clinical data of histological type i patients
+    clinical_i = clinical_here[clinical_here['histological_type'] == histological_type_i]
+    # Get rnaseq data of histological type i patients
+    rnaseq_i = rnaseq.loc[:, rnaseq.columns.isin(clinical_i.index)]
+    # Feature selection or data preprocessing
+    if features is not None:
+        rnaseq_i = rnaseq_i.loc[features]
+        # Save rnaseq dataset:
+        rnaseq_i.to_csv(os.path.join(save_dir_i, 'rnaseq_features.csv'))
+    # Remove lowly-expressed genes:
+    elif preprocess:
+        # Keep genes with 0 expression in at least 20% of the patients
+        rnaseq_redux = rnaseq_i[(rnaseq_i == 0).sum(axis=1) / rnaseq_i.shape[1] <= per / 100]
+        # Keep genes whose mean expression and variance is equal or above 0.5 (in both cases).
+        rnaseq_i = rnaseq_redux.iloc[(np.mean(rnaseq_redux, axis=1).values >= 0.5) &
+                                     (np.var(rnaseq_redux, axis=1).values >= 0.5)]
+        # Save rnaseq dataset:
+        rnaseq_i.to_csv(os.path.join(save_dir_i, 'rnaseq_preprocessed.csv'))
+    else:
+        print('no data preprocessing')
+    # Refine selected stages
+    clinical_subset = clinical_i[clinical_i['ajcc_pathologic_tumor_stage'].isin(possible_stages)]
+    num_classes = len(clinical_subset['ajcc_pathologic_tumor_stage'].unique())
+    # Obtain corresponding rnaseq info
+    rnaseq_subset = rnaseq_i.loc[:, np.isin(rnaseq_i.columns, clinical_subset.index)]
+    # Check patients in clinical and rnaseq data coincides
+    if clinical_subset.shape[0] != rnaseq_subset.shape[1]:
+        clinical_subset = clinical_subset[clinical_subset.index.isin(rnaseq_subset.columns)]
+    # Save clinical data
+    clinical_subset.to_csv(os.path.join(save_dir_i, 'clinical_subset.csv'))
+    # Check for no patients
+    if clinical_subset.shape[0] == 0 or rnaseq_subset.shape[1] == 0:
+        print(f'skipping {histological_type_i} classification because no patients were found')
+        return
+    # Scale rnaseq data
+    if scaler is not None:
+        cols_rnaseq = rnaseq_subset.columns
+        rows_rnaseq = rnaseq_subset.index
+        rnaseq_subset = scaler.fit_transform(rnaseq_subset)
+        # Save scaled rnaseq dataset:
+        pd.DataFrame(rnaseq_subset, columns=cols_rnaseq, index=rows_rnaseq).to_csv(
+            os.path.join(save_dir_i, 'rnaseq_scaled.csv'))
+    # Make classification
+    classification_type_fun = 'weighted' if classification_type.startswith('weighted') else 'unbalanced'
+    unbalanced_classification = classification_benchmark(
+        X_data=rnaseq_subset.T,
+        y_data=clinical_subset['ajcc_pathologic_tumor_stage'],
+        classification_type=classification_type_fun,
+        num_classes=num_classes,
+        seed=seed_here,
+        test_size=test_size,
+        n_br=n_br,
+        num_threads=n_threads,
+        n_trials=n_trials_optuna,
+    )
+
+    return unbalanced_classification, save_dir_i, seed_here, classification_type_fun
 
